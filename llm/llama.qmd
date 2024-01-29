@@ -1,0 +1,497 @@
+# LLaMA 2
+
+Llama 2 是一系列預先訓練和微調的生成文本模型，規模從70億到700億個參數不等，總共使用了 7 萬億 的 token 進行訓練。
+
+其開源模型包含分為 7B、13B、70B 等不同大小的模型，並且有不同 release，hf (huggingfaces) 和 chat (專門為對話微調的模型) 版本，因此共有 4*3 = 12 種不同的模型
+
+## Fine tune LLM
+
+微調大模型有很多種方式
+
+- Last Layer
+- Adapter
+- [prefix-tuning (P-tuning)](https://github.com/THUDM/P-tuning-v2)
+- [Prompt Tuning](https://zhuanlan.zhihu.com/p/415168620)
+- [LoRA](https://github.com/microsoft/LoRA) / [QLoRA](https://github.com/artidoro/qlora)
+
+我們這裡使用 LoRA 和 QLoRA 的方式微調
+
+## Finetune
+
+我們使用 Alpaca+LoRA 進行微調，我們當前的任務是要讓模型學會講中文，u因此我使用 [https://github.com/LC1332/Chinese-alpaca-lora](https://github.com/LC1332/Chinese-alpaca-lora) 中文數據集，我們先介紹我們使用的資料格式
+
+### Dataset
+
+資料格式為 json 格式，包含 3 個主要區塊
+
+- `instructions:` 指示詞
+- `input:` 模型的輸入
+- `output:` 標準答案
+
+在訓練過程中，我們會將 instructions 和 inputs 合併為輸入放入模型中訓練，以下我們看一些簡單的資料範例。
+
+```json
+    {
+      "instruction": "改写下面的句子，使用主动语态。",
+      "input": "“新闻报道被船长阅读了。”",
+      "output": "船长读了新闻报道。"
+    },
+    {
+      "instruction": "\"评估这个句子的拼写和语法错误\"。",
+      "input": "他吃完饭离开了餐厅。",
+      "output": "他吃完饭离开了餐厅。"
+    },
+    {
+      "instruction": "描述一个原子的结构。",
+      "input": "",
+      "output": "一个原子由核心组成，其中包含质子和中子，周围环绕着绕核运动的电子。质子和中子带有正电荷，而电子带有负电荷，导致整个原子是中性的。每种粒子的数量确定了原子的原子序数和类型。"
+    },
+```
+
+### Alpaca LoRA
+
+Alpaca LoRA 使用 LoRA 的方法訓練 Alpaca 
+
+#### Alpaca 
+
+Standford Alpaca 在 Meta 開源的 LLaMA 上面進行全參數的微調。主要的目的是要讓 AI 學會
+
+- 強大的基礎 LM
+- 高質量的 instruction data
+
+在 Alpaca 的設計中，Standford 選用 Meta 的 LLaMA-7B 做為 base model，並使用 Self-Instruct 的方式微調，所謂的 "Self-Instruct" 指的是使用較大的模型生成數據來訓練小的模型，其概念類似於知識蒸餾。
+
+![image](https://hackmd.io/_uploads/Hki_3HRYT.png)
+
+#### LoRA
+
+![image](https://hackmd.io/_uploads/SkAmHICtp.png)
+
+
+LLM 的一種看法是把數據映射到高維空間，來學習特徵的多樣化，但是在處理一個細分的下游任務時，我們通常只需要一部分的特徵，因此我們只需要微調整個特徵空間的一部分子空間即可，這些子空間所學習到的特徵相對較少，因此稱為 "Low Rank"，LoRA 的做法在於，在原始的參數矩陣上加上一個 low rank matrix
+
+$$
+Wx = Wx + BAx
+$$
+
+其中 A, B 為兩個 low rank matrix，$W$ 為原始模型的參數，在這裡，他們的參數量也是固定的，我們只需要讓梯度通過 AB 矩陣即可，例如，對於一個 (n,m) 的矩陣 $W$ 而言
+
+- $A \in \mathbb{R}^{r*m}$
+- $B \in \mathbb{R}^{n*r}$
+
+可以想像參數量的計算從 $n*m$ 降低到 $n*r+r*m$，當 $n, m$ 很大時，控制矩陣 rank $r$ 可以大幅降低參數量。另外矩陣 rank $r <= \min(n,m)$，在參數初始化階段，我們會將矩陣 $B$ 設置為 0 矩陣 $A$ 為高斯分布的抽樣 
+
+我先入為主認為 LoRA 的觀點不在於把一個高維矩陣做矩陣分解，而在於找到一個 low rank 的微調機制，用於在參數空間的子空間中調整出最適合下游任務的一個參數組合
+
+另外，QLoRA 也就只是把 LoRA + Quantilization 降低模型的記憶體占用而已。
+
+#### Alpaca + LoRA
+
+那 Alpaca + LoRA 的技術自然是固定 LLaMA 的餐數，使用 LoRA 的方式訓練指令數據集囉
+
+### Finetune config
+
+接下來介紹我們使用的 finetune config
+
+```yaml
+# model/data params
+base_model: LLaMA-7B-hf
+data_path: trans_chinese_alpaca_dataset.json
+
+# training params
+batch_size: 128
+micro_batch_size: 16
+num_epochs: 4
+learning_rate: 3e-4
+cutoff_len: 256
+val_set_size: 2000
+
+# lora params
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules: ["q_proj", "v_proj"]
+
+# llm params
+train_on_inputs: True
+add_eos_token: False
+group_by_length: False
+```
+
+以下我們介紹每個 config 代表的意義
+
+- Training params
+   - batch_size: 模型更新一次參數所看過的數據數量
+   - micro_batch_size: 模型 forward 一次的數據數量
+   - gradient_accumulation_steps = batch_size // 
+   - cutoff_len: 即 max_length，截斷文本的長度
+   - val_set_size: 驗證集的數據數量
+- LoRA params
+   - lora_r: matrix rank
+   - lora_alpha: 調整 lora 和原先矩陣的權重
+   - lora_dropout: lora 層的 dropout
+   - lora_target_modules: 需要執行 lora 
+- LLM params
+   - train_on_inputs: 計算 loss 要不要把忽略 input 
+   - add_eos_token: end of sequence token
+   - group_by_length: 是否把長度相似的文本合併
+
+### 實現過程
+
+這裡我們參考 [alpaca-lora](https://github.com/tloen/alpaca-lora) 的代碼做微調解析
+
+#### Prompter
+
+我們每次輸入給模型和的資料其實是一段有固定格式的文字，如下:
+
+```json
+{
+    "description": "Template used by Alpaca-LoRA.",
+    "prompt_input": "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
+    "prompt_no_input": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n",
+    "response_split": "### Response:"    
+}
+```
+
+從上面可以看到，input 是可有可無的一個輸入。在字串中，{instruction} 和 {input} 表示模型的輸入，為了方便處理，我們定義一個 Prompter 用來處理固定格式的字串如下:
+
+```python
+class Prompter(object):
+    __slots__ = ("template", "_verbose")
+
+    def __init__(self, template_name: str = "", verbose: bool = False):
+        self._verbose = verbose
+        if not template_name:
+            # Enforce the default here, so the constructor can be called with '' and will not break.
+            template_name = "alpaca"
+        file_name = osp.join("templates", f"{template_name}.json")
+        if not osp.exists(file_name):
+            raise ValueError(f"Can't read {file_name}")
+        with open(file_name) as fp:
+            self.template = json.load(fp)
+        if self._verbose:
+            print(
+                f"Using prompt template {template_name}: {self.template['description']}"
+            )
+
+    def generate_prompt(
+        self,
+        instruction: str,
+        input: Union[None, str] = None,
+        label: Union[None, str] = None,
+    ) -> str:
+        # returns the full prompt from instruction and optional input
+        # if a label (=response, =output) is provided, it's also appended.
+        if input:
+            res = self.template["prompt_input"].format(
+                instruction=instruction, input=input
+            )
+        else:
+            res = self.template["prompt_no_input"].format(
+                instruction=instruction
+            )
+        if label:
+            res = f"{res}{label}"
+        if self._verbose:
+            print(res)
+        return res
+
+    def get_response(self, output: str) -> str:
+        return output.split(self.template["response_split"])[1].strip()
+```
+
+在 `Prompter` 中，template 預設如上範例，我們在 generate_prompt 中，將傳入的資料使填入透過 `.format(kwargs=xxx)` 填入 Iinstruction 和 input，如果有提供 output (訓練階段)，我們就將 output 也合併 (`{res}{label}`)。另外一些格式如下
+
+- `prompt_input`: 在輸入不為 None 時使用的模板。使用 `{instruction}` 和 `{input}` 佔位符。
+- `prompt_no_input`: 在輸入為 None 時使用的模板。使用 `{instruction}` 佔位符。
+- `description`: 對模板的簡短描述，可能包含使用案例。
+- `response_split`: 在從模型輸出中切割實際響應時使用的分隔符。
+
+沒有使用 `{response}` 佔位符，因為響應始終是模板的最後一個元素，只需與其餘部分串聯。支援的 template 共有 alpaca, alpaca_legacy, alpace_short, vigogne，這裡就不展開討論了。
+
+#### Tokenizer
+
+處理完資料的串接，我們必須把字串轉成電腦看得懂的形式，也就是編碼，處理邏輯如下
+
+![image](https://hackmd.io/_uploads/S1VVg5e56.png)
+
+其中 tokenizer 的輸出共有
+
+- `input_ids:` 對應於上圖的 tokens_tensor，表示每個 token 對應到的 id (one-to-one)
+- `token_type_ids:` 對應於上圖的 segments_tensor，表示句子分隔線，在單一句子任務中，如情感分類，默認皆為 0，在配對句子中用 0, 1 區隔
+- `attention_mask:` 對應於上圖的 masks_tensor，表示注意力機制作用的範圍，1 表示作用注意力機制
+
+```python
+    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+
+    tokenizer.pad_token_id = (
+        0  # unk. we want this to be different from the eos token
+    )
+    tokenizer.padding_side = "left"  # Allow batched inference
+
+    def tokenize(prompt, add_eos_token=True):
+        # there's probably a way to do this with the tokenizer settings
+        # but again, gotta move fast
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=cutoff_len,
+            padding=False,
+            return_tensors=None,
+        )
+        if (
+            result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < cutoff_len
+            and add_eos_token
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+
+        result["labels"] = result["input_ids"].copy()
+
+        return result
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = prompter.generate_prompt(
+            data_point["instruction"],
+            data_point["input"],
+            data_point["output"],
+        )
+        tokenized_full_prompt = tokenize(full_prompt)
+        if not train_on_inputs:
+            user_prompt = prompter.generate_prompt(
+                data_point["instruction"], data_point["input"]
+            )
+            tokenized_user_prompt = tokenize(
+                user_prompt, add_eos_token=add_eos_token
+            )
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+            if add_eos_token:
+                user_prompt_len -= 1
+
+            tokenized_full_prompt["labels"] = [
+                -100
+            ] * user_prompt_len + tokenized_full_prompt["labels"][
+                user_prompt_len:
+            ]  # could be sped up, probably
+        return tokenized_full_prompt
+```
+
+我們將模型指示詞 (instruction, input, output) 通過 `Prompter` 得到輸出，之後輸入 `tokenizer` 得到編碼
+
+- `tokenize:` 進行編碼，並在句子最後一個位置加上 EOS token 表示生成句子結束，最後加上一個新的鍵 "labels" 用於紀錄句子標籤
+- `generate_and_tokenize_prompt:` 輸入資料字典，並呼叫 `tokenize` 進行編碼，如果是推理階段 (train_on_inputs) 則將 instruction 和 inputs 的 labels 設置為 -100，並用 inputs_ids 補至 max_length
+
+#### Load module
+
+接下來，我們導入需要使用的模組，在 hf 中，我們只需要呼叫幾個簡單的 API 即可完成訓練
+
+```python
+    model = LlamaForCausalLM.from_pretrained(
+        base_model,
+        # load_in_8bit=True,
+        torch_dtype=torch.float16,
+        device_map=device_map,
+    )
+    
+    model = prepare_model_for_int8_training(model)
+
+    config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+```
+
+- `load_in_8bit:` 是套件 bitsandbytes 提供的功能，主要將模型原本參數資料型態 fp32 (4 bytes) 轉換為 int8 (1 byte)，讓記憶體占用節省 1/4 空間。具體會把 `c_attn.weight` 和 `c_proj` 資料型態轉換為 int8，其餘則是 fp16
+- `prepare_model_for_int8_training:` 使用 LLM.int8() 方法使得 Attention 模塊中 LayerNorm 和輸出層保留 fp32 以保證模型在回答問題時的差異性 (這樣 sample 輸出時答案差距較大)，並且設置 `gradient_checkpoint=True`，即是在 forward 過程設置 `torch.no_grad()` 在計算圖中不儲存每個節點的梯度，只記錄輸入和激活函數，只有在 backward 時才會計算梯度，所以總共要進行兩次 forward，但是減少了記憶體占用
+- `get_peft_model:` 新增 LoRA 層，總共有 4 層，資料型態為 fp32
+   - `base_model.model.transformer.h.0.attn.c_attn.lora_A.default.weight`
+   - `base_model.model.transformer.h.0.attn.c_attn.lora_B.default.bias`
+   - `base_model.model.transformer.h.0.attn.c_attn.lora_A.default.weight`
+   - `base_model.model.transformer.h.0.attn.c_attn.lora_B.default.bias`
+
+#### Training
+
+接下來終於要進入訓練階段了
+
+```python
+    trainer = transformers.Trainer(
+        model=model,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        args=transformers.TrainingArguments(
+            per_device_train_batch_size=micro_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            warmup_steps=100,
+            num_train_epochs=num_epochs,
+            learning_rate=learning_rate,
+            fp16=True,
+            logging_steps=10,
+            optim="adamw_torch",
+            evaluation_strategy="steps" if val_set_size > 0 else "no",
+            save_strategy="steps",
+            eval_steps=200 if val_set_size > 0 else None,
+            save_steps=200,
+            output_dir=output_dir,
+            save_total_limit=3,
+            load_best_model_at_end=True if val_set_size > 0 else False,
+            ddp_find_unused_parameters=False if ddp else None,
+            group_by_length=group_by_length,
+            report_to="wandb" if use_wandb else None,
+            run_name=wandb_run_name if use_wandb else None,
+        ),
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+    )
+    model.config.use_cache = False
+
+    old_state_dict = model.state_dict
+    model.state_dict = (
+        lambda self, *_, **__: get_peft_model_state_dict(
+            self, old_state_dict()
+        )
+    ).__get__(model, type(model))
+
+    if torch.__version__ >= "2" and sys.platform != "win32":
+        model = torch.compile(model)
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    model.save_pretrained(output_dir)
+```
+
+需要注意到的是
+
+- `fp16=True:` 對於部分參數，在 forward 過程會以半經度 fp16 訓練，同時會複製一份 fp32 儲存，並在 backward 時使用全經度 fp32 進行更新。
+- `torch.comile:` 可以優化模型訓練速度 (pytorch 版本必須 >= 2)
+- `model.save_pretrained:` PeftModel 重新改寫了該方法，因此只會儲存 LoRA 的權重
+
+預設中使用 wandb 儲存訓練相關資訊，因此我們可以使用 wandb 視覺化訓練過程，筆者的訓練節果詳見 [https://wandb.ai/ddcvlab/Alpaca-LoRA](https://wandb.ai/ddcvlab/Alpaca-LoRA)
+
+#### Inference
+
+訓練完成過程當然要進行推理啦
+
+```python
+    base_model = base_model or os.environ.get("BASE_MODEL", "")
+    assert (
+        base_model
+    ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
+
+    prompter = Prompter(prompt_template)
+    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    if device == "cuda":
+        model = LlamaForCausalLM.from_pretrained(
+            base_model,
+            load_in_8bit=load_8bit,
+            torch_dtype=torch.float16,
+            device_map="cuda",
+        )
+        model = PeftModel.from_pretrained(
+            model,
+            lora_weights,
+            torch_dtype=torch.float16,
+        )
+    # unwind broken decapoda-research config
+    model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
+    model.config.bos_token_id = 1
+    model.config.eos_token_id = 2
+
+    if not load_8bit:
+        model.half()  # seems to fix bugs for some users.
+
+    model.eval()
+    if torch.__version__ >= "2" and sys.platform != "win32":
+        model = torch.compile(model)
+```
+
+基本上推理的代碼就沒有什麼需要特別說明的
+
+- `model.half():` 在把模型放入 GPU 之後，可以使用該方法將部分參數改為半精度，加速推理和減少顯存占用
+
+之後，我們定義 evaluate 函數
+
+```python
+    def evaluate(
+        instruction,
+        input=None,
+        temperature=0.1,
+        top_p=0.75,
+        top_k=40,
+        num_beams=4,
+        max_new_tokens=128,
+        stream_output=False,
+        **kwargs,
+    ):
+        prompt = prompter.generate_prompt(instruction, input)
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(device)
+        generation_config = GenerationConfig(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            num_beams=num_beams,
+            **kwargs,
+        )
+
+        with torch.no_grad():
+            generation_output = model.generate(
+                input_ids=input_ids,
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=True,
+                max_new_tokens=max_new_tokens,
+            )
+        s = generation_output.sequences[0]
+        output = tokenizer.decode(s)
+        yield prompter.get_response(output)
+```
+
+- `temprature:` 模型的創造力，越高的 temprature，則有越高的創造力，具體作用是把輸出的 logits 做 softmax + temprature
+
+$$
+\sigma(z_i) = \frac{e^{z_i}}{\sum_je^{z_j}} \to \frac{e^{\frac{z_i}{T}}}{\sum_je^\frac{z_j}{T}}
+$$
+
+![image](https://hackmd.io/_uploads/SylIrnecp.png)
+
+- `top_k:` 從機率最大的前 k 個抽樣
+
+![image](https://hackmd.io/_uploads/B147N2e56.png)
+
+- `top_p:` 大過於 top_p 的 token 才會被考慮生成
+
+![image](https://hackmd.io/_uploads/BJziNheqp.png)
+
+Note: 如果 `top_k` 和 `top_p` 都被設定，則會先作用 `top_k` 
+
+- `num_beams:` 在每一次生成 token 時，都會保留上一次生成子句中前 num_beams 個結果，然後繼續生成下一個子句，直到所有可能性都被生成完成，保留前 `num_beams` 個結果
+
+![image](https://hackmd.io/_uploads/SJvyFhg5T.png)
+
+#### Toy example
+
+![image](https://hackmd.io/_uploads/Bk3Pqng5T.png)
+
+![image](https://hackmd.io/_uploads/Bkrs53gqa.png)
+
+![image](https://hackmd.io/_uploads/B1639nlqT.png)
+
+![image](https://hackmd.io/_uploads/S1dks2xcp.png)
+
+![image](https://hackmd.io/_uploads/HklQi3e5T.png)
+
+從上述的範例中可以看到，LLaMA 中翻的程度慘不忍睹，另外，我們必須給定足夠的 information 才可以讓 AI 知道我們的需求
+
+## Reference
+
+- [https://docs.cohere.com/docs/the-cohere-platform](https://docs.cohere.com/docs/the-cohere-platform)
+- [https://zhuanlan.zhihu.com/p/616504594](https://zhuanlan.zhihu.com/p/616504594)
+- [https://github.com/tloen/alpaca-lora](https://github.com/tloen/alpaca-lora)
